@@ -1,6 +1,7 @@
+import json
 import pandas as pd
+import requests
 import streamlit as st
-from understatapi import UnderstatClient
 
 # --- 1. PAGE CONFIGURATION ---
 st.set_page_config(
@@ -10,39 +11,53 @@ st.set_page_config(
 st.title("📊 Understat Advanced Player & Shot Hub")
 st.markdown(
     "A stripped-back companion dashboard pulling underlying metrics (xG, xA,"
-    " shots, and key passes) directly from Understat."
+    " shots, and key passes) directly from Understat data feeds."
 )
 
 
-# --- 2. LOAD UNDERSTAT DATA ---
+# --- 2. LOAD UNDERSTAT DATA DIRECTLY ---
 @st.cache_data(ttl=3600)
-def load_understat_players(season_year="2025"):
+def load_understat_data(season_year="2025"):
+  url = f"https://understat.com/league/EPL/{season_year}"
   try:
-    with UnderstatClient() as understat:
-      # Fetch EPL player data for the given season
-      player_data = understat.league(league="EPL").get_player_data(
-          season=season_year
-      )
-      if player_data:
-        df = pd.DataFrame(player_data)
+    response = requests.get(url)
+    if response.status_code != 200:
+      st.error(f"Failed to connect to Understat (Status code: {response.status_code})")
+      return pd.DataFrame()
+
+    # Understat embeds players data inside JavaScript variables on the page
+    html_content = response.text
+    start_str = "JSON.parse(''"
+    
+    # Extract players data script block
+    for line in html_content.split("\n"):
+      if "decodeURIComponent" in line and "playersData" in line:
+        # Extract the encoded string
+        start_idx = line.index("('") + 2
+        end_idx = line.rindex("')")
+        encoded_data = line[start_idx:end_idx]
+        
+        import urllib.parse
+        decoded_json = urllib.parse.unquote(encoded_data)
+        players_raw = json.loads(decoded_json)
+        
+        df = pd.DataFrame(players_raw)
         return df
-  except Exception as e:
-    st.error(
-        f"Failed to fetch data from Understat: {e}. Make sure 'understatapi'"
-        " is installed (`pip install understatapi`)."
-    )
+
+    st.warning("Could not automatically locate player data block in the page source.")
     return pd.DataFrame()
-  return pd.DataFrame()
+    
+  except Exception as e:
+    st.error(f"Error fetching data: {e}")
+    return pd.DataFrame()
 
 
 with st.spinner("Fetching advanced underlying metrics from Understat..."):
-  # Using 2025/2026 season (adjust season string as needed)
-  df_understat = load_understat_players("2025")
+  df_understat = load_understat_data("2025")
 
 if df_understat.empty:
   st.warning(
-      "No data returned. If the season hasn't populated yet, try changing the"
-      " season year in the code."
+      "No data returned yet. If the season hasn't populated data points, check back later."
   )
 else:
   # Convert numeric columns from string to proper floats/ints
@@ -64,9 +79,7 @@ else:
   ]
   for col in numeric_cols:
     if col in df_understat.columns:
-      df_understat[col] = pd.to_numeric(df_understat[col], errors="coerce").fillna(
-          0
-      )
+      df_understat[col] = pd.to_numeric(df_understat[col], errors="coerce").fillna(0)
 
   # --- 3. SIDEBAR THRESHOLD FILTERS ---
   st.sidebar.header("🔍 Advanced Filters")
