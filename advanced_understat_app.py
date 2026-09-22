@@ -1,8 +1,13 @@
+import asyncio
+import nest_asyncio
 import pandas as pd
 import soccerdata as sd
 import streamlit as st
 from thefuzz import fuzz, process
-from understatapi import UnderstatClient
+from understat import Understat
+
+# Apply nest_asyncio to safely manage event loops inside Streamlit
+nest_asyncio.apply()
 
 # --- 1. PAGE CONFIGURATION ---
 st.set_page_config(
@@ -16,7 +21,6 @@ st.markdown(
 )
 
 # --- 2. SEASON SELECTOR ---
-# Note: 2026 = 2026/27, 2025 = 2025/26, 2024 = 2024/25
 selected_season = st.sidebar.selectbox(
     "Select Season",
     options=[2026, 2025, 2024, 2023],
@@ -25,11 +29,33 @@ selected_season = st.sidebar.selectbox(
 )
 
 
-# --- 3. FUZZY MERGE HELPER FUNCTION ---
+# --- 3. ASYNC UNDERSTAT FETCHERS ---
+async def fetch_understat_players(season_year):
+    import aiohttp
+
+    async with aiohttp.ClientSession() as session:
+        understat = Understat(session)
+        players = await understat.get_league_players(
+            "EPL", season=str(season_year)
+        )
+        return players
+
+
+async def fetch_understat_teams(season_year):
+    import aiohttp
+
+    async with aiohttp.ClientSession() as session:
+        understat = Understat(session)
+        teams = await understat.get_league_results(
+            "EPL", season=str(season_year)
+        )
+        return teams
+
+
+# --- 4. FUZZY MERGE HELPER FUNCTION ---
 def merge_understat_and_fbref(df_understat, df_fbref, threshold=75):
     """Merges Understat and FBref DataFrames on player names using fuzzy matching."""
     if df_fbref.empty:
-        # Fallback if FBref data fails to return
         return df_understat
 
     fbref_names = df_fbref["player_clean"].dropna().unique().tolist()
@@ -38,7 +64,7 @@ def merge_understat_and_fbref(df_understat, df_fbref, threshold=75):
     for _, u_row in df_understat.iterrows():
         u_name = u_row["player_clean"]
 
-        # Find best fuzzy name match from FBref dataset
+        # Extract top fuzzy match candidate from FBref name list
         best_match, score, _ = process.extractOne(
             u_name, fbref_names, scorer=fuzz.token_sort_ratio
         )
@@ -50,18 +76,31 @@ def merge_understat_and_fbref(df_understat, df_fbref, threshold=75):
             if not fbref_matches.empty:
                 f_row = fbref_matches.iloc[0]
 
-                # Merge FBref columns (handling multi-index/flattened column names safely)
+                # Extract FBref metric fields safely across flat or multi-level columns
                 row_dict["touches_box"] = f_row.get(
-                    ("Touches", "Att Pen"), f_row.get("touches_att_pen", 0)
+                    ("Touches", "Att Pen"),
+                    f_row.get(
+                        "touches_att_pen", f_row.get("Touches_Att Pen", 0)
+                    ),
                 )
                 row_dict["prog_carries"] = f_row.get(
-                    ("Carries", "PrgC"), f_row.get("progressive_carries", 0)
+                    ("Carries", "PrgC"),
+                    f_row.get(
+                        "progressive_carries",
+                        f_row.get("Carries_PrgC", f_row.get("PrgC", 0)),
+                    ),
                 )
                 row_dict["sca"] = f_row.get(
-                    ("SCA", "SCA"), f_row.get("sca", 0)
+                    ("SCA", "SCA"), f_row.get("sca", f_row.get("SCA_SCA", 0))
                 )
                 row_dict["sca_dead"] = f_row.get(
-                    ("SCA Types", "Dead"), f_row.get("sca_dead", 0)
+                    ("SCA Types", "Dead"),
+                    f_row.get(
+                        "sca_dead",
+                        f_row.get(
+                            "SCA Types_Dead", f_row.get("SCA_Dead", 0)
+                        ),
+                    ),
                 )
         else:
             row_dict["touches_box"] = 0
@@ -74,40 +113,38 @@ def merge_understat_and_fbref(df_understat, df_fbref, threshold=75):
     return pd.DataFrame(merged_rows)
 
 
-# --- 4. DATA LOADER ---
+# --- 5. DATA LOADER ---
 @st.cache_data(ttl=1800)
 def load_combined_data(season_year=2026):
     data_payload = {}
 
-    # A. Fetch Understat Data
+    # A. Fetch Understat Data asynchronously
     try:
-        with UnderstatClient() as understat:
-            player_data = understat.league(league="EPL").get_player_data(
-                season=season_year
-            )
-            team_data = understat.league(league="EPL").get_team_data(
-                season=season_year
-            )
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        player_data = loop.run_until_complete(
+            fetch_understat_players(season_year)
+        )
+        team_data = loop.run_until_complete(fetch_understat_teams(season_year))
 
-            if not player_data:
-                st.warning(
-                    f"Understat has not published aggregated data for"
-                    f" {season_year}/{season_year+1-2000} yet."
-                )
-                return None
+        if not player_data:
+            st.warning(
+                f"Understat has not published aggregated data for"
+                f" {season_year}/{season_year+1-2000} yet."
+            )
+            return None
 
-            df_understat = pd.DataFrame(player_data)
-            data_payload["teamsData"] = team_data
+        df_understat = pd.DataFrame(player_data)
+        data_payload["teamsData"] = team_data
     except Exception as e:
         st.error(f"Error fetching Understat data: {e}")
         return None
 
-    # B. Fetch FBref Data
+    # B. Fetch FBref Data via soccerdata
     df_fbref = pd.DataFrame()
     try:
         fbref = sd.FBref(leagues="ENG-Premier League", seasons=season_year)
 
-        # Read standard stats (contains touches/carries) and SCA stats
         df_fb_std = (
             fbref.read_player_season_stats(stat_type="standard")
             .reset_index()
@@ -117,7 +154,7 @@ def load_combined_data(season_year=2026):
             .reset_index()
         )
 
-        # Flatten columns if multi-indexed
+        # Standardize column headers if multi-index
         if isinstance(df_fb_std.columns, pd.MultiIndex):
             df_fb_std.columns = [
                 "_".join(col).strip() if col[1] else col[0]
@@ -129,8 +166,10 @@ def load_combined_data(season_year=2026):
                 for col in df_fb_gca.columns
             ]
 
-        # Standardize player name column
-        player_col = [col for col in df_fb_std.columns if "player" in col.lower()]
+        # Standardize FBref player name column
+        player_col = [
+            col for col in df_fb_std.columns if "player" in col.lower()
+        ]
         if player_col:
             df_fb_std["player_clean"] = (
                 df_fb_std[player_col[0]].astype(str).str.lower().str.strip()
@@ -138,10 +177,11 @@ def load_combined_data(season_year=2026):
             df_fbref = df_fb_std
     except Exception as e:
         st.info(
-            f"FBref metrics are currently building/unavailable for this season: {e}"
+            f"FBref metrics are currently building or unavailable for this"
+            f" season: {e}"
         )
 
-    # Clean Understat Names
+    # Standardize Understat player names
     df_understat["player_clean"] = (
         df_understat["player_name"].astype(str).str.lower().str.strip()
     )
@@ -153,9 +193,8 @@ def load_combined_data(season_year=2026):
     return data_payload
 
 
-with st.spinner(
-    "Fetching & merging metrics from Understat + FBref..."
-):
+# Load cached dataset
+with st.spinner("Fetching & merging metrics from Understat + FBref..."):
     data = load_combined_data(selected_season)
 
 if not data or "playersData" not in data or data["playersData"].empty:
@@ -174,7 +213,7 @@ else:
     with tab1:
         df_players = pd.DataFrame(data["playersData"])
 
-        # Convert numeric columns
+        # Convert numeric columns safely
         numeric_cols = [
             "games",
             "time",
@@ -196,15 +235,6 @@ else:
                 df_players[col] = pd.to_numeric(
                     df_players[col], errors="coerce"
                 ).fillna(0)
-
-        # Calculate Attacking Involvement Ratio
-        df_players["attacking_ratio"] = (
-            (df_players["xG"] + df_players["xA"])
-            / df_players["xGChain"].replace(0, 1)
-        ) * 100
-        df_players["attacking_ratio"] = df_players["attacking_ratio"].clip(
-            upper=100
-        )
 
         # Sidebar Filters
         st.sidebar.markdown("---")
@@ -228,7 +258,7 @@ else:
             "Min Touches in Box (FBref)", min_value=0, value=0, step=5
         )
 
-        # Apply Filters
+        # Filter Logic
         filtered_df = df_players.copy()
         if selected_team != "All":
             filtered_df = filtered_df[filtered_df["team_title"] == selected_team]
@@ -299,25 +329,25 @@ else:
 
         if "teamsData" in data and data["teamsData"]:
             teams_list = []
-            for team_id, team_info in data["teamsData"].items():
-                team_name = team_info.get("title")
-                history = team_info.get("history", [])
+            for match in data["teamsData"]:
+                h_team = match.get("h", {}).get("title")
+                a_team = match.get("a", {}).get("title")
+                h_xg = float(match.get("xG", {}).get("h", 0))
+                a_xg = float(match.get("xG", {}).get("a", 0))
 
-                x_g_against = sum(match.get("xGA", 0) for match in history)
-                goals_against = sum(match.get("a", 0) for match in history)
+                # Accumulate xGA (Expected Goals Allowed) for each team
+                teams_list.append({"Team": h_team, "xGA": a_xg})
+                teams_list.append({"Team": a_team, "xGA": h_xg})
 
-                teams_list.append(
-                    {
-                        "Team": team_name,
-                        "Matches": len(history),
-                        "Goals Conceded": goals_against,
-                        "xGA (Expected Conceded)": round(x_g_against, 2),
-                    }
-                )
+            df_teams_summary = (
+                pd.DataFrame(teams_list)
+                .groupby("Team")
+                .agg(Matches=("xGA", "count"), xGA=("xGA", "sum"))
+                .reset_index()
+            )
 
-            df_teams_summary = pd.DataFrame(teams_list)
-            if not df_teams_summary.empty:
-                df_teams_summary = df_teams_summary.sort_values(
-                    by="xGA (Expected Conceded)", ascending=False
-                ).reset_index(drop=True)
-                st.dataframe(df_teams_summary, use_container_width=True)
+            df_teams_summary["xGA"] = df_teams_summary["xGA"].round(2)
+            df_teams_summary = df_teams_summary.sort_values(
+                by="xGA", ascending=False
+            ).reset_index(drop=True)
+            st.dataframe(df_teams_summary, use_container_width=True)
