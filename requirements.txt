@@ -1,8 +1,5 @@
 streamlit
 pandas
-understat
-soccerdata
 thefuzz
-python-Levenshtein
 nest_asyncio
 requests
