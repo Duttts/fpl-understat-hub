@@ -19,8 +19,12 @@ st.markdown(
 # --- 2. SEASON SELECTOR ---
 selected_season = st.sidebar.selectbox(
     "Select Season",
-    options=[2025, 2024, 2023, 2022],
-    format_func=lambda x: f"{x}/{x+1-2000}",
+    options=[2026, 2025, 2024, 2023],
+    format_func=lambda x: (
+        f"{x}/{x+1-2000} (Current Season)"
+        if x == 2026
+        else f"{x}/{x+1-2000}"
+    ),
     index=0,
 )
 
@@ -36,8 +40,16 @@ HEADERS = {
 
 # --- 3. DIRECT RAW JSON PARSER FOR UNDERSTAT ---
 def fetch_understat_data(season_year):
-    """Directly extracts Understat's underlying JSON data embedded in page scripts."""
-    url = f"https://understat.com/league/EPL/{season_year}"
+    """Directly extracts Understat's underlying JSON data embedded in page scripts.
+
+    Handles current active season (no trailing year) vs archived seasons.
+    """
+    # Active current season uses the main URL root
+    if season_year == 2026:
+        url = "https://understat.com/league/EPL"
+    else:
+        url = f"https://understat.com/league/EPL/{season_year}"
+
     try:
         response = requests.get(url, headers=HEADERS, timeout=10)
         if response.status_code != 200:
@@ -72,20 +84,22 @@ def fetch_understat_data(season_year):
 # --- 4. SAFE FBREF PARSER ---
 def fetch_fbref_data(season_year):
     """Safely attempts to parse FBref stats table without breaking on block/timeout."""
-    url = f"https://fbref.com/en/squads/epl/{season_year}/stats/"
+    if season_year == 2026:
+        url = "https://fbref.com/en/squads/epl/stats/"
+    else:
+        url = f"https://fbref.com/en/squads/epl/{season_year}/stats/"
+
     try:
         response = requests.get(url, headers=HEADERS, timeout=8)
         if response.status_code == 200:
             tables = pd.read_html(response.text)
             if tables:
                 df = tables[0]
-                # Flatten multi-index headers if present
                 if isinstance(df.columns, pd.MultiIndex):
                     df.columns = [
                         "_".join(c).strip() if c[1] else c[0]
                         for c in df.columns
                     ]
-                # Locate player column
                 p_col = [c for c in df.columns if "player" in c.lower()]
                 if p_col:
                     df["player_clean"] = (
@@ -93,7 +107,6 @@ def fetch_fbref_data(season_year):
                     )
                     return df
     except Exception:
-        # Silently fail if FBref blocks requests
         pass
     return pd.DataFrame()
 
@@ -102,7 +115,6 @@ def fetch_fbref_data(season_year):
 def merge_metrics(df_understat, df_fbref, threshold=75):
     """Merges Understat and FBref data tables using name fuzzy-matching."""
     if df_fbref.empty or "player_clean" not in df_fbref.columns:
-        # Default FBref columns to 0 if FBref is unavailable
         for col in ["touches_box", "prog_carries", "sca", "sca_dead"]:
             df_understat[col] = 0
         return df_understat
@@ -128,7 +140,6 @@ def merge_metrics(df_understat, df_fbref, threshold=75):
             if not fb_matches.empty:
                 f_row = fb_matches.iloc[0]
 
-                # Safe extraction across various column naming formats
                 row_dict["touches_box"] = f_row.get(
                     "Touches_Att Pen", f_row.get("touches_att_pen", 0)
                 )
@@ -163,10 +174,7 @@ def load_all_data(season_year):
         df_u["player_name"].astype(str).str.lower().str.strip()
     )
 
-    # Attempt to fetch FBref data (fails gracefully if blocked)
     df_fb = fetch_fbref_data(season_year)
-
-    # Combine metrics
     merged_df = merge_metrics(df_u, df_fb)
 
     return {"playersData": merged_df, "teamsData": t_data}
@@ -178,8 +186,8 @@ with st.spinner("Fetching data from metrics providers..."):
 
 if not data or "playersData" not in data or data["playersData"].empty:
     st.warning(
-        "Could not load player data for this season. Please pick a completed"
-        " season or try clearing the app cache."
+        "Could not load player data for this season. Please pick another"
+        " season or clear the app cache."
     )
 else:
     tab1, tab2 = st.tabs(
@@ -192,7 +200,6 @@ else:
     with tab1:
         df_players = pd.DataFrame(data["playersData"])
 
-        # Format numeric fields
         num_cols = [
             "games",
             "time",
@@ -215,7 +222,6 @@ else:
                     df_players[c], errors="coerce"
                 ).fillna(0)
 
-        # Filters
         st.sidebar.markdown("---")
         st.sidebar.header("🔍 Player Threshold Filters")
 
@@ -265,7 +271,6 @@ else:
             "sca_dead",
         ]
 
-        # Ensure all display columns exist
         for col in display_columns:
             if col not in filtered_df.columns:
                 filtered_df[col] = 0
