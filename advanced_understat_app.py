@@ -1,9 +1,6 @@
-import codecs
-import json
-import re
-import cloudscraper
 import pandas as pd
 import streamlit as st
+from understatapi import UnderstatClient
 
 # --- 1. PAGE CONFIGURATION ---
 st.set_page_config(
@@ -17,48 +14,32 @@ st.markdown(
 )
 
 # --- 2. SEASON SELECTOR ---
-# Note: Understat uses the starting year for seasons:
-# 2026 = 2026/27, 2025 = 2025/26, 2024 = 2024/25
+# Understat uses starting years (e.g. 2025 = 2025/26 season)
 selected_season = st.sidebar.selectbox(
     "Select Season",
-    options=["2026", "2025", "2024", "2023"],
-    format_func=lambda x: f"{x}/{int(x)+1-2000}",
+    options=[2025, 2024, 2023],
+    format_func=lambda x: f"{x}/{x+1-2000}",
     index=0,
 )
 
 
-# --- 3. LOAD UNDERSTAT DATA (PLAYERS & TEAMS) ---
+# --- 3. LOAD UNDERSTAT DATA ---
 @st.cache_data(ttl=3600)
-def load_understat_data(season_year="2026"):
-    url = f"https://understat.com/league/EPL/{season_year}"
+def load_understat_data(season_year=2025):
     try:
-        # Create a CloudScraper instance to bypass Cloudflare
-        scraper = cloudscraper.create_scraper()
-        response = scraper.get(url)
-
-        if response.status_code != 200:
-            st.error(
-                f"Failed to connect to Understat (Status code:"
-                f" {response.status_code})"
+        with UnderstatClient() as understat:
+            # Fetch player stats for league
+            player_data = understat.league(league="EPL").get_player_data(
+                season=season_year
             )
-            return None
+            # Fetch team stats for league
+            team_data = understat.league(league="EPL").get_team_data(
+                season=season_year
+            )
 
-        data_payload = {}
-
-        # Look for JavaScript JSON.parse script blocks
-        for key in ["playersData", "teamsData"]:
-            pattern = rf"{key}\s*=\s*JSON\.parse\('([^']+)'\)"
-            match = re.search(pattern, response.text)
-
-            if match:
-                raw_hex_data = match.group(1)
-                # Decode \x20 hex sequences used by Understat into valid JSON text
-                decoded_json = codecs.decode(raw_hex_data, "unicode_escape")
-                data_payload[key] = json.loads(decoded_json)
-
-        return data_payload
+            return {"playersData": player_data, "teamsData": team_data}
     except Exception as e:
-        st.error(f"Error fetching data: {e}")
+        st.error(f"Error fetching data from Understat: {e}")
         return None
 
 
@@ -67,16 +48,19 @@ with st.spinner("Fetching advanced underlying metrics from Understat..."):
 
 if not data or "playersData" not in data or not data["playersData"]:
     st.warning(
-        "No data returned for this season selection. The selected season may"
-        " not have started or Understat has not populated this feed yet."
+        "No data returned for this season selection. Please clear your"
+        " Streamlit cache or verify the season has started."
     )
 else:
     tab1, tab2 = st.tabs(["⚽ Player Metrics", "🛡️ Team Vulnerability (xGA)"])
 
-    # TAB 1: PLAYER METRICS
+    # ==========================================
+    # TAB 1: PLAYER METRICS & THRESHOLD FILTERS
+    # ==========================================
     with tab1:
         df_players = pd.DataFrame(data["playersData"])
 
+        # Convert numeric columns
         numeric_cols = [
             "games",
             "time",
@@ -139,6 +123,7 @@ else:
             "xGChain",
             "xGBuildup",
         ]
+
         filtered_df = filtered_df.sort_values(by="xG", ascending=False).reset_index(
             drop=True
         )
@@ -147,11 +132,30 @@ else:
             f"Advanced Metrics Leaderboard ({len(filtered_df)} players matched)"
         )
         if not filtered_df.empty:
-            st.dataframe(filtered_df[display_columns], use_container_width=True)
+            renamed_df = filtered_df[display_columns].rename(
+                columns={
+                    "player_name": "Player",
+                    "team_title": "Team",
+                    "position": "Pos",
+                    "time": "Mins",
+                    "goals": "Goals",
+                    "xG": "xG",
+                    "shots": "Shots",
+                    "assists": "Assists",
+                    "xA": "xA",
+                    "key_passes": "Key Passes",
+                    "xGChain": "xG Chain",
+                    "xGBuildup": "xG Buildup",
+                }
+            )
+            st.dataframe(renamed_df, use_container_width=True)
 
+    # ==========================================
     # TAB 2: TEAM VULNERABILITY
+    # ==========================================
     with tab2:
         st.subheader("🛡️ Team Defensive Vulnerability Analysis")
+
         if "teamsData" in data and data["teamsData"]:
             teams_list = []
             for team_id, team_info in data["teamsData"].items():
