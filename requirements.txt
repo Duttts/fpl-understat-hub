@@ -1,3 +1,6 @@
 streamlit
 pandas
 understatapi
+soccerdata
+thefuzz
+python-Levenshtein
