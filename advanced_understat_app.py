@@ -16,21 +16,27 @@ st.markdown(
     " (Touches in Box, SCA, Progressive Actions) into a single master table."
 )
 
-# --- 2. SEASON SELECTOR ---
-# Note: Understat uses the START year of the season (e.g. 2025 = 2025/26 season)
+# --- 2. SEASON SELECTOR & REFRESH CONTROL ---
 SEASON_MAPPING = {
-    "2025/26 (Current Season)": 2025,
+    "2026/27 (Current Season)": 2026,
+    "2025/26": 2025,
     "2024/25": 2024,
     "2023/24": 2023,
     "2022/23": 2022,
 }
 
+st.sidebar.header("⚙️ Data Settings")
 selected_label = st.sidebar.selectbox(
     "Select Season", options=list(SEASON_MAPPING.keys()), index=0
 )
 selected_season_year = SEASON_MAPPING[selected_label]
 
-# Standard Browser Headers
+# Manual cache bust button in sidebar
+if st.sidebar.button("🔄 Force Refresh Data"):
+    st.cache_data.clear()
+    st.rerun()
+
+# Browser headers to avoid 403 Forbidden / Cloudflare IP blocks
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML,"
@@ -38,20 +44,22 @@ HEADERS = {
     ),
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://understat.com/",
 }
 
 
-# --- 3. DIRECT RAW JSON PARSER FOR UNDERSTAT ---
+# --- 3. RAW JSON PARSER FOR UNDERSTAT ---
 def fetch_understat_data(season_year):
-    """Fetches Understat player & match data using the season's start year."""
+    """Fetches Understat player & match data with full error reporting on UI."""
     url = f"https://understat.com/league/EPL/{season_year}"
 
     try:
         response = requests.get(url, headers=HEADERS, timeout=12)
+
         if response.status_code != 200:
             st.error(
-                f"Understat HTTP status {response.status_code} for"
-                f" URL: {url}"
+                f"⚠️ Understat connection blocked (HTTP {response.status_code})."
+                " Streamlit Cloud IP may be rate-limited."
             )
             return None, None
 
@@ -75,14 +83,15 @@ def fetch_understat_data(season_year):
             teams_data = json.loads(clean_json)
 
         return players_data, teams_data
+
     except Exception as e:
-        st.error(f"Error connecting to Understat ({url}): {e}")
+        st.error(f"⚠️ Network error while accessing Understat ({url}): {e}")
         return None, None
 
 
 # --- 4. SAFE FBREF PARSER ---
 def fetch_fbref_data(season_year):
-    """Safely attempts to parse FBref stats table without crashing if blocked."""
+    """Safely attempts to parse FBref stats table without breaking the app if blocked."""
     url = f"https://fbref.com/en/squads/epl/{season_year}/stats/"
 
     try:
@@ -176,23 +185,21 @@ def load_all_data(season_year):
     return {"playersData": merged_df, "teamsData": t_data}
 
 
-# Execute App Logic
+# --- 7. APP RUNTIME LOGIC ---
 with st.spinner("Fetching metrics from Understat..."):
     data = load_all_data(selected_season_year)
 
 if not data or "playersData" not in data or data["playersData"].empty:
     st.warning(
-        f"Unable to load player data for the {selected_label} season. Click"
-        " 'Clear cache' in the top-right Streamlit menu to refresh."
+        f"Unable to render data for {selected_label}. Click 'Force Refresh"
+        " Data' in the left sidebar to try re-fetching."
     )
 else:
     tab1, tab2 = st.tabs(
         ["⚽ Unified Player Metrics", "🛡️ Team Vulnerability (xGA)"]
     )
 
-    # ==========================================
-    # TAB 1: UNIFIED PLAYER METRICS
-    # ==========================================
+    # TAB 1: PLAYER METRICS
     with tab1:
         df_players = pd.DataFrame(data["playersData"])
 
@@ -219,7 +226,7 @@ else:
                 ).fillna(0)
 
         st.sidebar.markdown("---")
-        st.sidebar.header("🔍 Player Threshold Filters")
+        st.sidebar.header("🔍 Player Filters")
 
         teams = ["All"] + sorted(df_players["team_title"].unique().tolist())
         selected_team = st.sidebar.selectbox("Filter by Team", teams)
@@ -233,9 +240,6 @@ else:
         min_xg = st.sidebar.number_input(
             "Min Expected Goals (xG)", min_value=0.0, value=0.0, step=0.05
         )
-        min_box_touches = st.sidebar.number_input(
-            "Min Touches in Box (FBref)", min_value=0, value=0, step=5
-        )
 
         filtered_df = df_players.copy()
         if selected_team != "All":
@@ -246,10 +250,6 @@ else:
             filtered_df = filtered_df[filtered_df["time"] >= min_minutes]
         if min_xg > 0:
             filtered_df = filtered_df[filtered_df["xG"] >= min_xg]
-        if min_box_touches > 0:
-            filtered_df = filtered_df[
-                filtered_df["touches_box"] >= min_box_touches
-            ]
 
         display_columns = [
             "player_name",
@@ -298,14 +298,8 @@ else:
                 }
             )
             st.dataframe(renamed_df, use_container_width=True)
-        else:
-            st.warning(
-                "No players match your threshold filters. Try lowering your criteria."
-            )
 
-    # ==========================================
-    # TAB 2: TEAM VULNERABILITY (xGA)
-    # ==========================================
+    # TAB 2: TEAM VULNERABILITY
     with tab2:
         st.subheader("🛡️ Team Defensive Vulnerability Analysis")
 
