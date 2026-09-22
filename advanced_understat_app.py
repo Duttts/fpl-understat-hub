@@ -17,45 +17,44 @@ st.markdown(
 )
 
 # --- 2. SEASON SELECTOR ---
-selected_season = st.sidebar.selectbox(
-    "Select Season",
-    options=[2026, 2025, 2024, 2023],
-    format_func=lambda x: (
-        f"{x}/{x+1-2000} (Current Season)"
-        if x == 2026
-        else f"{x}/{x+1-2000}"
-    ),
-    index=0,
-)
+# Note: Understat uses the START year of the season (e.g. 2025 = 2025/26 season)
+SEASON_MAPPING = {
+    "2025/26 (Current Season)": 2025,
+    "2024/25": 2024,
+    "2023/24": 2023,
+    "2022/23": 2022,
+}
 
-# Standard Browser Headers to Bypass Scraper Blocks
+selected_label = st.sidebar.selectbox(
+    "Select Season", options=list(SEASON_MAPPING.keys()), index=0
+)
+selected_season_year = SEASON_MAPPING[selected_label]
+
+# Standard Browser Headers
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML,"
-        " like Gecko) Chrome/122.0.0.0 Safari/537.36"
+        " like Gecko) Chrome/124.0.0.0 Safari/537.36"
     ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
 }
 
 
 # --- 3. DIRECT RAW JSON PARSER FOR UNDERSTAT ---
 def fetch_understat_data(season_year):
-    """Directly extracts Understat's underlying JSON data embedded in page scripts.
-
-    Handles current active season (no trailing year) vs archived seasons.
-    """
-    # Active current season uses the main URL root
-    if season_year == 2026:
-        url = "https://understat.com/league/EPL"
-    else:
-        url = f"https://understat.com/league/EPL/{season_year}"
+    """Fetches Understat player & match data using the season's start year."""
+    url = f"https://understat.com/league/EPL/{season_year}"
 
     try:
-        response = requests.get(url, headers=HEADERS, timeout=10)
+        response = requests.get(url, headers=HEADERS, timeout=12)
         if response.status_code != 200:
+            st.error(
+                f"Understat HTTP status {response.status_code} for"
+                f" URL: {url}"
+            )
             return None, None
 
-        # Extract JSON strings embedded in JavaScript
         players_match = re.search(
             r"playersData\s*=\s*JSON\.parse\('([^']+)'\)", response.text
         )
@@ -77,17 +76,14 @@ def fetch_understat_data(season_year):
 
         return players_data, teams_data
     except Exception as e:
-        st.error(f"Error connecting to Understat: {e}")
+        st.error(f"Error connecting to Understat ({url}): {e}")
         return None, None
 
 
 # --- 4. SAFE FBREF PARSER ---
 def fetch_fbref_data(season_year):
-    """Safely attempts to parse FBref stats table without breaking on block/timeout."""
-    if season_year == 2026:
-        url = "https://fbref.com/en/squads/epl/stats/"
-    else:
-        url = f"https://fbref.com/en/squads/epl/{season_year}/stats/"
+    """Safely attempts to parse FBref stats table without crashing if blocked."""
+    url = f"https://fbref.com/en/squads/epl/{season_year}/stats/"
 
     try:
         response = requests.get(url, headers=HEADERS, timeout=8)
@@ -162,7 +158,7 @@ def merge_metrics(df_understat, df_fbref, threshold=75):
 
 
 # --- 6. CACHED DATA LOAD PIPELINE ---
-@st.cache_data(ttl=1800)
+@st.cache_data(ttl=600)
 def load_all_data(season_year):
     p_data, t_data = fetch_understat_data(season_year)
 
@@ -181,13 +177,13 @@ def load_all_data(season_year):
 
 
 # Execute App Logic
-with st.spinner("Fetching data from metrics providers..."):
-    data = load_all_data(selected_season)
+with st.spinner("Fetching metrics from Understat..."):
+    data = load_all_data(selected_season_year)
 
 if not data or "playersData" not in data or data["playersData"].empty:
     st.warning(
-        "Could not load player data for this season. Please pick another"
-        " season or clear the app cache."
+        f"Unable to load player data for the {selected_label} season. Click"
+        " 'Clear cache' in the top-right Streamlit menu to refresh."
     )
 else:
     tab1, tab2 = st.tabs(
