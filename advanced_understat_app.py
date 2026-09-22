@@ -1,210 +1,154 @@
-import json
-import re
 import pandas as pd
-import requests
 import streamlit as st
-from thefuzz import fuzz, process
+from understatapi import UnderstatClient
 
 # --- 1. PAGE CONFIGURATION ---
 st.set_page_config(
-    page_title="Unified FPL Analytics Hub", page_icon="📊", layout="wide"
+    page_title="Understat Advanced Metrics Hub", page_icon="📊", layout="wide"
 )
 
-st.title("📊 Unified FPL Advanced Analytics Hub")
+st.title("📊 Understat Advanced Analytics Hub")
 st.markdown(
-    "A companion dashboard merging Understat (Shot xG & xGChain) and FBref"
-    " (Touches in Box, SCA, Progressive Actions) into a single master table."
+    "A companion dashboard pulling underlying player and team metrics directly"
+    " from Understat."
 )
 
-# --- 2. SEASON SELECTOR & REFRESH CONTROL ---
-SEASON_MAPPING = {
-    "2026/27 (Current Season)": 2026,
-    "2025/26": 2025,
-    "2024/25": 2024,
-    "2023/24": 2023,
-    "2022/23": 2022,
-}
-
-st.sidebar.header("⚙️ Data Settings")
-selected_label = st.sidebar.selectbox(
-    "Select Season", options=list(SEASON_MAPPING.keys()), index=0
+# --- 2. SEASON SELECTOR ---
+# Understat uses starting years (e.g., 2026 = 2026/27, 2025 = 2025/26)
+selected_season = st.sidebar.selectbox(
+    "Select Season",
+    options=[2026, 2025, 2024, 2023],
+    format_func=lambda x: f"{x}/{x+1-2000}",
+    index=0,
 )
-selected_season_year = SEASON_MAPPING[selected_label]
-
-# Manual cache bust button in sidebar
-if st.sidebar.button("🔄 Force Refresh Data"):
-    st.cache_data.clear()
-    st.rerun()
-
-# Browser headers to avoid 403 Forbidden / Cloudflare IP blocks
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML,"
-        " like Gecko) Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Referer": "https://understat.com/",
-}
 
 
-# --- 3. RAW JSON PARSER FOR UNDERSTAT ---
-def fetch_understat_data(season_year):
-    """Fetches Understat player & match data with full error reporting on UI."""
-    url = f"https://understat.com/league/EPL/{season_year}"
-
+# --- 3. LOAD UNDERSTAT DATA ---
+@st.cache_data(ttl=1800)  # Caches for 30 mins so live match data refreshes
+def load_understat_data(season_year=2026):
     try:
-        response = requests.get(url, headers=HEADERS, timeout=12)
-
-        if response.status_code != 200:
-            st.error(
-                f"⚠️ Understat connection blocked (HTTP {response.status_code})."
-                " Streamlit Cloud IP may be rate-limited."
+        with UnderstatClient() as understat:
+            player_data = understat.league(league="EPL").get_player_data(
+                season=season_year
             )
-            return None, None
+            team_data = understat.league(league="EPL").get_team_data(
+                season=season_year
+            )
 
-        players_match = re.search(
-            r"playersData\s*=\s*JSON\.parse\('([^']+)'\)", response.text
-        )
-        teams_match = re.search(
-            r"datesData\s*=\s*JSON\.parse\('([^']+)'\)", response.text
-        )
+            if not player_data:
+                st.warning(
+                    f"Understat hasn't published aggregated player data for"
+                    f" the {season_year}/{season_year+1-2000} season yet. Try"
+                    " selecting a completed season or check back after"
+                    " matchday metrics finalize."
+                )
+                return None
 
-        players_data, teams_data = None, None
-
-        if players_match:
-            raw_hex = players_match.group(1)
-            clean_json = bytes(raw_hex, "utf-8").decode("unicode_escape")
-            players_data = json.loads(clean_json)
-
-        if teams_match:
-            raw_hex = teams_match.group(1)
-            clean_json = bytes(raw_hex, "utf-8").decode("unicode_escape")
-            teams_data = json.loads(clean_json)
-
-        return players_data, teams_data
+            return {"playersData": player_data, "teamsData": team_data}
 
     except Exception as e:
-        st.error(f"⚠️ Network error while accessing Understat ({url}): {e}")
-        return None, None
-
-
-# --- 4. SAFE FBREF PARSER ---
-def fetch_fbref_data(season_year):
-    """Safely attempts to parse FBref stats table without breaking the app if blocked."""
-    url = f"https://fbref.com/en/squads/epl/{season_year}/stats/"
-
-    try:
-        response = requests.get(url, headers=HEADERS, timeout=8)
-        if response.status_code == 200:
-            tables = pd.read_html(response.text)
-            if tables:
-                df = tables[0]
-                if isinstance(df.columns, pd.MultiIndex):
-                    df.columns = [
-                        "_".join(c).strip() if c[1] else c[0]
-                        for c in df.columns
-                    ]
-                p_col = [c for c in df.columns if "player" in c.lower()]
-                if p_col:
-                    df["player_clean"] = (
-                        df[p_col[0]].astype(str).str.lower().str.strip()
-                    )
-                    return df
-    except Exception:
-        pass
-    return pd.DataFrame()
-
-
-# --- 5. FUZZY MERGE ENGINE ---
-def merge_metrics(df_understat, df_fbref, threshold=75):
-    """Merges Understat and FBref data tables using name fuzzy-matching."""
-    if df_fbref.empty or "player_clean" not in df_fbref.columns:
-        for col in ["touches_box", "prog_carries", "sca", "sca_dead"]:
-            df_understat[col] = 0
-        return df_understat
-
-    fbref_names = df_fbref["player_clean"].dropna().unique().tolist()
-    merged_rows = []
-
-    for _, u_row in df_understat.iterrows():
-        u_name = u_row.get("player_clean", "")
-
-        best_match, score, _ = (
-            process.extractOne(
-                u_name, fbref_names, scorer=fuzz.token_sort_ratio
-            )
-            if fbref_names
-            else (None, 0, None)
-        )
-
-        row_dict = u_row.to_dict()
-
-        if score >= threshold and best_match:
-            fb_matches = df_fbref[df_fbref["player_clean"] == best_match]
-            if not fb_matches.empty:
-                f_row = fb_matches.iloc[0]
-
-                row_dict["touches_box"] = f_row.get(
-                    "Touches_Att Pen", f_row.get("touches_att_pen", 0)
-                )
-                row_dict["prog_carries"] = f_row.get(
-                    "Carries_PrgC", f_row.get("progressive_carries", 0)
-                )
-                row_dict["sca"] = f_row.get("SCA_SCA", f_row.get("sca", 0))
-                row_dict["sca_dead"] = f_row.get(
-                    "SCA Types_Dead", f_row.get("sca_dead", 0)
-                )
-        else:
-            row_dict["touches_box"] = 0
-            row_dict["prog_carries"] = 0
-            row_dict["sca"] = 0
-            row_dict["sca_dead"] = 0
-
-        merged_rows.append(row_dict)
-
-    return pd.DataFrame(merged_rows)
-
-
-# --- 6. CACHED DATA LOAD PIPELINE ---
-@st.cache_data(ttl=600)
-def load_all_data(season_year):
-    p_data, t_data = fetch_understat_data(season_year)
-
-    if not p_data:
+        st.error(f"Error fetching data from Understat: {e}")
         return None
 
-    df_u = pd.DataFrame(p_data)
-    df_u["player_clean"] = (
-        df_u["player_name"].astype(str).str.lower().str.strip()
-    )
 
-    df_fb = fetch_fbref_data(season_year)
-    merged_df = merge_metrics(df_u, df_fb)
+with st.spinner("Fetching advanced underlying metrics from Understat..."):
+    data = load_understat_data(selected_season)
 
-    return {"playersData": merged_df, "teamsData": t_data}
-
-
-# --- 7. APP RUNTIME LOGIC ---
-with st.spinner("Fetching metrics from Understat..."):
-    data = load_all_data(selected_season_year)
-
-if not data or "playersData" not in data or data["playersData"].empty:
-    st.warning(
-        f"Unable to render data for {selected_label}. Click 'Force Refresh"
-        " Data' in the left sidebar to try re-fetching."
+if not data or "playersData" not in data or not data["playersData"]:
+    st.info(
+        "No data available for the selected season. Switch seasons in the sidebar"
+        " or clear your cache."
     )
 else:
-    tab1, tab2 = st.tabs(
-        ["⚽ Unified Player Metrics", "🛡️ Team Vulnerability (xGA)"]
-    )
+    # --- CREATE TABS ---
+    tab1, tab2 = st.tabs(["⚽ Player Metrics", "🛡️ Team Vulnerability (xGA)"])
 
-    # TAB 1: PLAYER METRICS
+    # ==========================================
+    # TAB 1: PLAYER METRICS & THRESHOLD FILTERS
+    # ==========================================
     with tab1:
         df_players = pd.DataFrame(data["playersData"])
 
-        num_cols = [
+        # Convert numeric columns
+        numeric_cols = [
             "games",
+            "time",
+            "goals",
+            "xG",
+            "shots",
+            "assists",
+            "xA",
+            "key_passes",
+            "yellow_cards",
+            "red_cards",
+            "npg",
+            "npxG",
+            "xGChain",
+            "xGBuildup",
+        ]
+        for col in numeric_cols:
+            if col in df_players.columns:
+                df_players[col] = pd.to_numeric(
+                    df_players[col], errors="coerce"
+                ).fillna(0)
+
+        # Sidebar Filters
+        st.sidebar.markdown("---")
+        st.sidebar.header("🔍 Player Threshold Filters")
+
+        teams = ["All"] + sorted(df_players["team_title"].unique().tolist())
+        selected_team = st.sidebar.selectbox("Filter by Team", teams)
+
+        positions = ["All"] + sorted(df_players["position"].unique().tolist())
+        selected_position = st.sidebar.selectbox("Filter by Position", positions)
+
+        st.sidebar.markdown("---")
+        st.sidebar.subheader("Numerical Thresholds (>=)")
+        min_minutes = st.sidebar.number_input(
+            "Min Minutes Played", min_value=0, value=0, step=90
+        )
+        min_shots = st.sidebar.number_input(
+            "Min Total Shots", min_value=0.0, value=0.0, step=1.0
+        )
+        min_xg = st.sidebar.number_input(
+            "Min Expected Goals (xG)", min_value=0.0, value=0.0, step=0.05
+        )
+        min_key_passes = st.sidebar.number_input(
+            "Min Key Passes", min_value=0.0, value=0.0, step=1.0
+        )
+        min_xa = st.sidebar.number_input(
+            "Min Expected Assists (xA)", min_value=0.0, value=0.0, step=0.05
+        )
+        min_xg_chain = st.sidebar.number_input(
+            "Min xG Chain (Overall Involvement)",
+            min_value=0.0,
+            value=0.0,
+            step=0.5,
+        )
+
+        # Apply Filters
+        filtered_df = df_players.copy()
+        if selected_team != "All":
+            filtered_df = filtered_df[filtered_df["team_title"] == selected_team]
+        if selected_position != "All":
+            filtered_df = filtered_df[filtered_df["position"] == selected_position]
+        if min_minutes > 0:
+            filtered_df = filtered_df[filtered_df["time"] >= min_minutes]
+        if min_shots > 0:
+            filtered_df = filtered_df[filtered_df["shots"] >= min_shots]
+        if min_xg > 0:
+            filtered_df = filtered_df[filtered_df["xG"] >= min_xg]
+        if min_key_passes > 0:
+            filtered_df = filtered_df[filtered_df["key_passes"] >= min_key_passes]
+        if min_xa > 0:
+            filtered_df = filtered_df[filtered_df["xA"] >= min_xa]
+        if min_xg_chain > 0:
+            filtered_df = filtered_df[filtered_df["xGChain"] >= min_xg_chain]
+
+        display_columns = [
+            "player_name",
+            "team_title",
+            "position",
             "time",
             "goals",
             "xG",
@@ -214,69 +158,14 @@ else:
             "key_passes",
             "xGChain",
             "xGBuildup",
-            "touches_box",
-            "prog_carries",
-            "sca",
-            "sca_dead",
         ]
-        for c in num_cols:
-            if c in df_players.columns:
-                df_players[c] = pd.to_numeric(
-                    df_players[c], errors="coerce"
-                ).fillna(0)
-
-        st.sidebar.markdown("---")
-        st.sidebar.header("🔍 Player Filters")
-
-        teams = ["All"] + sorted(df_players["team_title"].unique().tolist())
-        selected_team = st.sidebar.selectbox("Filter by Team", teams)
-
-        positions = ["All"] + sorted(df_players["position"].unique().tolist())
-        selected_position = st.sidebar.selectbox("Filter by Position", positions)
-
-        min_minutes = st.sidebar.number_input(
-            "Min Minutes Played", min_value=0, value=0, step=90
-        )
-        min_xg = st.sidebar.number_input(
-            "Min Expected Goals (xG)", min_value=0.0, value=0.0, step=0.05
-        )
-
-        filtered_df = df_players.copy()
-        if selected_team != "All":
-            filtered_df = filtered_df[filtered_df["team_title"] == selected_team]
-        if selected_position != "All":
-            filtered_df = filtered_df[filtered_df["position"] == selected_position]
-        if min_minutes > 0:
-            filtered_df = filtered_df[filtered_df["time"] >= min_minutes]
-        if min_xg > 0:
-            filtered_df = filtered_df[filtered_df["xG"] >= min_xg]
-
-        display_columns = [
-            "player_name",
-            "team_title",
-            "position",
-            "time",
-            "goals",
-            "xG",
-            "assists",
-            "xA",
-            "xGChain",
-            "touches_box",
-            "prog_carries",
-            "sca",
-            "sca_dead",
-        ]
-
-        for col in display_columns:
-            if col not in filtered_df.columns:
-                filtered_df[col] = 0
 
         filtered_df = filtered_df.sort_values(by="xG", ascending=False).reset_index(
             drop=True
         )
 
         st.subheader(
-            f"Unified Metrics Leaderboard ({len(filtered_df)} players matched)"
+            f"Advanced Metrics Leaderboard ({len(filtered_df)} players matched)"
         )
 
         if not filtered_df.empty:
@@ -287,44 +176,58 @@ else:
                     "position": "Pos",
                     "time": "Mins",
                     "goals": "Goals",
-                    "xG": "xG (Understat)",
+                    "xG": "xG",
+                    "shots": "Shots",
                     "assists": "Assists",
-                    "xA": "xA (Understat)",
+                    "xA": "xA",
+                    "key_passes": "Key Passes",
                     "xGChain": "xG Chain",
-                    "touches_box": "Box Touches (FBref)",
-                    "prog_carries": "Prog Carries (FBref)",
-                    "sca": "SCA Total (FBref)",
-                    "sca_dead": "Set-Piece SCA (FBref)",
+                    "xGBuildup": "xG Buildup",
                 }
             )
             st.dataframe(renamed_df, use_container_width=True)
+        else:
+            st.warning(
+                "No players match your threshold filters. Try lowering your criteria."
+            )
 
-    # TAB 2: TEAM VULNERABILITY
+    # ==========================================
+    # TAB 2: TEAM VULNERABILITY (DEFENSIVE METRICS)
+    # ==========================================
     with tab2:
         st.subheader("🛡️ Team Defensive Vulnerability Analysis")
+        st.markdown(
+            "Ranked by **Expected Goals Against (xGA)**. Teams at the top are"
+            " conceding the highest quality chances defensively, making them prime"
+            " targets for your attacking transfers."
+        )
 
         if "teamsData" in data and data["teamsData"]:
             teams_list = []
-            for match in data["teamsData"]:
-                if isinstance(match, dict):
-                    h_team = match.get("h", {}).get("title")
-                    a_team = match.get("a", {}).get("title")
-                    h_xg = float(match.get("xG", {}).get("h", 0))
-                    a_xg = float(match.get("xG", {}).get("a", 0))
+            for team_id, team_info in data["teamsData"].items():
+                team_name = team_info.get("title")
+                history = team_info.get("history", [])
 
-                    teams_list.append({"Team": h_team, "xGA": a_xg})
-                    teams_list.append({"Team": a_team, "xGA": h_xg})
+                matches_played = len(history)
+                x_g_against = sum(match.get("xGA", 0) for match in history)
+                goals_against = sum(match.get("a", 0) for match in history)
 
-            if teams_list:
-                df_teams_summary = (
-                    pd.DataFrame(teams_list)
-                    .groupby("Team")
-                    .agg(Matches=("xGA", "count"), xGA=("xGA", "sum"))
-                    .reset_index()
+                teams_list.append(
+                    {
+                        "Team": team_name,
+                        "Matches": matches_played,
+                        "Goals Conceded": goals_against,
+                        "xGA (Expected Conceded)": round(x_g_against, 2),
+                    }
                 )
 
-                df_teams_summary["xGA"] = df_teams_summary["xGA"].round(2)
+            df_teams_summary = pd.DataFrame(teams_list)
+            if not df_teams_summary.empty:
                 df_teams_summary = df_teams_summary.sort_values(
-                    by="xGA", ascending=False
+                    by="xGA (Expected Conceded)", ascending=False
                 ).reset_index(drop=True)
                 st.dataframe(df_teams_summary, use_container_width=True)
+            else:
+                st.info("Team match statistics are still compiling for this season.")
+        else:
+            st.info("Team data block not found.")
