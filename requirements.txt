@@ -1,6 +1,6 @@
 streamlit
 pandas
-understatapi
+understat
 soccerdata
 thefuzz
 python-Levenshtein
