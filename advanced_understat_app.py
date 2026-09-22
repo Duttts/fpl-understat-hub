@@ -1,12 +1,15 @@
 import asyncio
+import json
+import re
 import nest_asyncio
 import pandas as pd
+import requests
 import soccerdata as sd
 import streamlit as st
 from thefuzz import fuzz, process
 from understat import Understat
 
-# Apply nest_asyncio to safely manage event loops inside Streamlit
+# Apply nest_asyncio to support async loops inside Streamlit
 nest_asyncio.apply()
 
 # --- 1. PAGE CONFIGURATION ---
@@ -23,39 +26,55 @@ st.markdown(
 # --- 2. SEASON SELECTOR ---
 selected_season = st.sidebar.selectbox(
     "Select Season",
-    options=[2026, 2025, 2024, 2023],
+    options=[2025, 2024, 2023, 2022],
     format_func=lambda x: f"{x}/{x+1-2000}",
     index=0,
 )
 
 
-# --- 3. ASYNC UNDERSTAT FETCHERS ---
-async def fetch_understat_players(season_year):
-    import aiohttp
-
-    async with aiohttp.ClientSession() as session:
-        understat = Understat(session)
-        players = await understat.get_league_players(
-            "EPL", season=str(season_year)
+# --- 3. DIRECT JSON FALLBACK FOR UNDERSTAT (If API scraper is blocked) ---
+def fetch_understat_direct(season_year):
+    """Fallback parser that extracts raw JSON directly from Understat's HTML script tags."""
+    url = f"https://understat.com/league/EPL/{season_year}"
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            " (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         )
-        return players
+    }
+    response = requests.get(url, headers=headers, timeout=10)
+    if response.status_code != 200:
+        return None, None
 
+    players_match = re.search(
+        r"playersData\s*=\s*JSON\.parse\('([^']+)'\)", response.text
+    )
+    teams_match = re.search(
+        r"datesData\s*=\s*JSON\.parse\('([^']+)'\)", response.text
+    )
 
-async def fetch_understat_teams(season_year):
-    import aiohttp
+    players_data, teams_data = None, None
 
-    async with aiohttp.ClientSession() as session:
-        understat = Understat(session)
-        teams = await understat.get_league_results(
-            "EPL", season=str(season_year)
-        )
-        return teams
+    if players_match:
+        raw_hex = players_match.group(1)
+        clean_json = bytes(raw_hex, "utf-8").decode("unicode_escape")
+        players_data = json.loads(clean_json)
+
+    if teams_match:
+        raw_hex = teams_match.group(1)
+        clean_json = bytes(raw_hex, "utf-8").decode("unicode_escape")
+        teams_data = json.loads(clean_json)
+
+    return players_data, teams_data
 
 
 # --- 4. FUZZY MERGE HELPER FUNCTION ---
 def merge_understat_and_fbref(df_understat, df_fbref, threshold=75):
-    """Merges Understat and FBref DataFrames on player names using fuzzy matching."""
-    if df_fbref.empty:
+    """Merges Understat and FBref DataFrames safely on player names using fuzzy matching."""
+    if df_fbref is None or df_fbref.empty or "player_clean" not in df_fbref.columns:
+        # Default FBref fields to zero if FBref fails to load
+        for col in ["touches_box", "prog_carries", "sca", "sca_dead"]:
+            df_understat[col] = 0
         return df_understat
 
     fbref_names = df_fbref["player_clean"].dropna().unique().tolist()
@@ -64,43 +83,30 @@ def merge_understat_and_fbref(df_understat, df_fbref, threshold=75):
     for _, u_row in df_understat.iterrows():
         u_name = u_row["player_clean"]
 
-        # Extract top fuzzy match candidate from FBref name list
-        best_match, score, _ = process.extractOne(
-            u_name, fbref_names, scorer=fuzz.token_sort_ratio
+        best_match, score, _ = (
+            process.extractOne(
+                u_name, fbref_names, scorer=fuzz.token_sort_ratio
+            )
+            if fbref_names
+            else (None, 0, None)
         )
 
         row_dict = u_row.to_dict()
 
-        if score >= threshold:
+        if score >= threshold and best_match:
             fbref_matches = df_fbref[df_fbref["player_clean"] == best_match]
             if not fbref_matches.empty:
                 f_row = fbref_matches.iloc[0]
 
-                # Extract FBref metric fields safely across flat or multi-level columns
                 row_dict["touches_box"] = f_row.get(
-                    ("Touches", "Att Pen"),
-                    f_row.get(
-                        "touches_att_pen", f_row.get("Touches_Att Pen", 0)
-                    ),
+                    "touches_att_pen", f_row.get("Touches_Att Pen", 0)
                 )
                 row_dict["prog_carries"] = f_row.get(
-                    ("Carries", "PrgC"),
-                    f_row.get(
-                        "progressive_carries",
-                        f_row.get("Carries_PrgC", f_row.get("PrgC", 0)),
-                    ),
+                    "progressive_carries", f_row.get("Carries_PrgC", 0)
                 )
-                row_dict["sca"] = f_row.get(
-                    ("SCA", "SCA"), f_row.get("sca", f_row.get("SCA_SCA", 0))
-                )
+                row_dict["sca"] = f_row.get("sca", f_row.get("SCA_SCA", 0))
                 row_dict["sca_dead"] = f_row.get(
-                    ("SCA Types", "Dead"),
-                    f_row.get(
-                        "sca_dead",
-                        f_row.get(
-                            "SCA Types_Dead", f_row.get("SCA_Dead", 0)
-                        ),
-                    ),
+                    "sca_dead", f_row.get("SCA Types_Dead", 0)
                 )
         else:
             row_dict["touches_box"] = 0
@@ -113,60 +119,58 @@ def merge_understat_and_fbref(df_understat, df_fbref, threshold=75):
     return pd.DataFrame(merged_rows)
 
 
-# --- 5. DATA LOADER ---
+# --- 5. SAFE DATA LOADER ---
 @st.cache_data(ttl=1800)
-def load_combined_data(season_year=2026):
+def load_combined_data(season_year=2025):
     data_payload = {}
+    player_data, team_data = None, None
 
-    # A. Fetch Understat Data asynchronously
+    # A. Try Understat async library first
     try:
+        import aiohttp
+
+        async def fetch_understat():
+            async with aiohttp.ClientSession() as session:
+                u = Understat(session)
+                p = await u.get_league_players("EPL", season=str(season_year))
+                t = await u.get_league_results("EPL", season=str(season_year))
+                return p, t
+
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        player_data = loop.run_until_complete(
-            fetch_understat_players(season_year)
+        player_data, team_data = loop.run_until_complete(fetch_understat())
+    except Exception:
+        # Fallback to direct HTML parsing if aiohttp/Understat scraper is blocked
+        try:
+            player_data, team_data = fetch_understat_direct(season_year)
+        except Exception:
+            player_data, team_data = None, None
+
+    if not player_data:
+        st.error(
+            "Unable to connect to Understat. The site might be temporarily"
+            " blocking cloud requests."
         )
-        team_data = loop.run_until_complete(fetch_understat_teams(season_year))
-
-        if not player_data:
-            st.warning(
-                f"Understat has not published aggregated data for"
-                f" {season_year}/{season_year+1-2000} yet."
-            )
-            return None
-
-        df_understat = pd.DataFrame(player_data)
-        data_payload["teamsData"] = team_data
-    except Exception as e:
-        st.error(f"Error fetching Understat data: {e}")
         return None
 
-    # B. Fetch FBref Data via soccerdata
+    df_understat = pd.DataFrame(player_data)
+    data_payload["teamsData"] = team_data
+
+    # B. Safely fetch FBref data without crashing if blocked
     df_fbref = pd.DataFrame()
     try:
         fbref = sd.FBref(leagues="ENG-Premier League", seasons=season_year)
-
         df_fb_std = (
             fbref.read_player_season_stats(stat_type="standard")
             .reset_index()
         )
-        df_fb_gca = (
-            fbref.read_player_season_stats(stat_type="gca")
-            .reset_index()
-        )
 
-        # Standardize column headers if multi-index
         if isinstance(df_fb_std.columns, pd.MultiIndex):
             df_fb_std.columns = [
                 "_".join(col).strip() if col[1] else col[0]
                 for col in df_fb_std.columns
             ]
-        if isinstance(df_fb_gca.columns, pd.MultiIndex):
-            df_fb_gca.columns = [
-                "_".join(col).strip() if col[1] else col[0]
-                for col in df_fb_gca.columns
-            ]
 
-        # Standardize FBref player name column
         player_col = [
             col for col in df_fb_std.columns if "player" in col.lower()
         ]
@@ -175,13 +179,11 @@ def load_combined_data(season_year=2026):
                 df_fb_std[player_col[0]].astype(str).str.lower().str.strip()
             )
             df_fbref = df_fb_std
-    except Exception as e:
-        st.info(
-            f"FBref metrics are currently building or unavailable for this"
-            f" season: {e}"
-        )
+    except Exception:
+        # FBref failed or was blocked; continue cleanly with Understat data alone
+        pass
 
-    # Standardize Understat player names
+    # Clean Understat names
     df_understat["player_clean"] = (
         df_understat["player_name"].astype(str).str.lower().str.strip()
     )
@@ -198,9 +200,9 @@ with st.spinner("Fetching & merging metrics from Understat + FBref..."):
     data = load_combined_data(selected_season)
 
 if not data or "playersData" not in data or data["playersData"].empty:
-    st.info(
-        "No data available for the selected season. Try clearing your Streamlit"
-        " cache or select another season."
+    st.warning(
+        "No data retrieved for this season. Please select a completed season"
+        " (e.g., 2024/25)."
     )
 else:
     tab1, tab2 = st.tabs(
@@ -213,7 +215,6 @@ else:
     with tab1:
         df_players = pd.DataFrame(data["playersData"])
 
-        # Convert numeric columns safely
         numeric_cols = [
             "games",
             "time",
@@ -236,7 +237,6 @@ else:
                     df_players[col], errors="coerce"
                 ).fillna(0)
 
-        # Sidebar Filters
         st.sidebar.markdown("---")
         st.sidebar.header("🔍 Player Threshold Filters")
 
@@ -258,7 +258,6 @@ else:
             "Min Touches in Box (FBref)", min_value=0, value=0, step=5
         )
 
-        # Filter Logic
         filtered_df = df_players.copy()
         if selected_team != "All":
             filtered_df = filtered_df[filtered_df["team_title"] == selected_team]
@@ -288,6 +287,11 @@ else:
             "sca",
             "sca_dead",
         ]
+
+        # Ensure all display columns exist
+        for c in display_columns:
+            if c not in filtered_df.columns:
+                filtered_df[c] = 0
 
         filtered_df = filtered_df.sort_values(by="xG", ascending=False).reset_index(
             drop=True
@@ -322,7 +326,7 @@ else:
             )
 
     # ==========================================
-    # TAB 2: TEAM VULNERABILITY (DEFENSIVE METRICS)
+    # TAB 2: TEAM VULNERABILITY (xGA)
     # ==========================================
     with tab2:
         st.subheader("🛡️ Team Defensive Vulnerability Analysis")
@@ -330,24 +334,27 @@ else:
         if "teamsData" in data and data["teamsData"]:
             teams_list = []
             for match in data["teamsData"]:
-                h_team = match.get("h", {}).get("title")
-                a_team = match.get("a", {}).get("title")
-                h_xg = float(match.get("xG", {}).get("h", 0))
-                a_xg = float(match.get("xG", {}).get("a", 0))
+                if isinstance(match, dict):
+                    h_team = match.get("h", {}).get("title")
+                    a_team = match.get("a", {}).get("title")
+                    h_xg = float(match.get("xG", {}).get("h", 0))
+                    a_xg = float(match.get("xG", {}).get("a", 0))
 
-                # Accumulate xGA (Expected Goals Allowed) for each team
-                teams_list.append({"Team": h_team, "xGA": a_xg})
-                teams_list.append({"Team": a_team, "xGA": h_xg})
+                    teams_list.append({"Team": h_team, "xGA": a_xg})
+                    teams_list.append({"Team": a_team, "xGA": h_xg})
 
-            df_teams_summary = (
-                pd.DataFrame(teams_list)
-                .groupby("Team")
-                .agg(Matches=("xGA", "count"), xGA=("xGA", "sum"))
-                .reset_index()
-            )
+            if teams_list:
+                df_teams_summary = (
+                    pd.DataFrame(teams_list)
+                    .groupby("Team")
+                    .agg(Matches=("xGA", "count"), xGA=("xGA", "sum"))
+                    .reset_index()
+                )
 
-            df_teams_summary["xGA"] = df_teams_summary["xGA"].round(2)
-            df_teams_summary = df_teams_summary.sort_values(
-                by="xGA", ascending=False
-            ).reset_index(drop=True)
-            st.dataframe(df_teams_summary, use_container_width=True)
+                df_teams_summary["xGA"] = df_teams_summary["xGA"].round(2)
+                df_teams_summary = df_teams_summary.sort_values(
+                    by="xGA", ascending=False
+                ).reset_index(drop=True)
+                st.dataframe(df_teams_summary, use_container_width=True)
+            else:
+                st.info("Team level data not formatted for this season.")
