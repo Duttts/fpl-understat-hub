@@ -18,7 +18,7 @@ st.markdown(
     " based on **each team's last 5 completed matches**."
 )
 
-# --- 2. SEASON SELECTOR ---
+# --- 2. SEASON SELECTOR & SLIDER ---
 selected_season = st.sidebar.selectbox(
     "Select Season",
     options=[2026, 2025, 2024, 2023],
@@ -26,13 +26,12 @@ selected_season = st.sidebar.selectbox(
     index=0,
 )
 
-# Sidebar toggle for window length
 gw_window = st.sidebar.slider(
     "Recent Match Window",
     min_value=3,
     max_value=10,
     value=5,
-    help="Filters all metrics to only include data from each team's last N matches.",
+    help="Filters player shot maps and team stats to only include data from each team's last N matches.",
 )
 
 
@@ -53,6 +52,7 @@ def map_position_category(raw_pos):
 
 
 def classify_shot_zone(x, y):
+    """Classifies Understat normalized X (0 to 1) and Y (0 to 1) coordinates into zones."""
     if x >= 0.94 and 0.37 <= y <= 0.63:
         return "Six-Yard Box"
     elif x >= 0.83 and 0.21 <= y <= 0.79:
@@ -79,7 +79,6 @@ async def fetch_recent_league_data(season_year, recent_matches_count=5):
         recent_match_ids = set()
         team_last_n_matches = {}
 
-        # Collect unique teams
         all_teams = set(df_results["h"].apply(lambda x: x["title"])).union(
             set(df_results["a"].apply(lambda x: x["title"]))
         )
@@ -93,7 +92,7 @@ async def fetch_recent_league_data(season_year, recent_matches_count=5):
             team_last_n_matches[team] = team_matches
             recent_match_ids.update(team_matches["id"].tolist())
 
-        # 2. Fetch league player data
+        # 2. Fetch league player data (full season aggregate for fast main table loading)
         player_data = await understat.get_league_players("EPL", season_year)
 
         return {
@@ -136,7 +135,7 @@ def load_player_shot_data(player_id):
 
 
 with st.spinner(
-    f"Filtering data for the last {gw_window} matches per team..."
+    f"Loading data for the last {gw_window} matches per team..."
 ):
     data = load_understat_data(selected_season, gw_window)
 
@@ -146,11 +145,11 @@ else:
     recent_match_ids = data["recentMatchIds"]
 
     tab1, tab2, tab3 = st.tabs(
-        ["⚽ Player Recent Metrics", "🎯 Recent Shot Maps", "🛡️ Recent Team xGA"]
+        ["⚽ Player Metrics", "🎯 Recent Shot Maps & Zones", "🛡️ Recent Team xGA"]
     )
 
     # ==========================================
-    # TAB 1: PLAYER RECENT METRICS
+    # TAB 1: PLAYER METRICS (Original fast table)
     # ==========================================
     with tab1:
         df_players = pd.DataFrame(data["playersData"])
@@ -284,11 +283,11 @@ else:
             st.warning("No players match your filters.")
 
     # ==========================================
-    # TAB 2: RECENT SHOT MAPS (STRICTLY LAST N GWs)
+    # TAB 2: RECENT SHOT MAPS & ZONE TABLES
     # ==========================================
     with tab2:
         st.subheader(
-            f"🎯 Player Shot Map (Last {gw_window} Team Matches Only)"
+            f"🎯 Player Shot Map & Zone Breakdown (Last {gw_window} Team Matches Only)"
         )
 
         player_options = (
@@ -297,7 +296,7 @@ else:
             .tolist()
         )
         selected_player_name = st.selectbox(
-            "Select Player", options=player_options, index=0
+            "Select Player for Map & Zones", options=player_options, index=0
         )
 
         player_info = df_players[
@@ -335,6 +334,9 @@ else:
                 df_recent_shots["xG"] = pd.to_numeric(
                     df_recent_shots["xG"], errors="coerce"
                 ).round(3)
+                df_recent_shots["Shot_Zone"] = df_recent_shots.apply(
+                    lambda r: classify_shot_zone(r["X"], r["Y"]), axis=1
+                )
 
                 total_recent_shots = len(df_recent_shots)
                 total_recent_xg = df_recent_shots["xG"].sum()
@@ -351,34 +353,116 @@ else:
 
                 st.markdown("---")
 
-                fig = px.scatter(
-                    df_recent_shots,
-                    x="Y",
-                    y="X",
-                    color="result",
-                    size="xG",
-                    size_max=18,
-                    hover_data=["minute", "xG", "shotType", "situation", "date"],
-                    labels={"Y": "Pitch Width", "X": "Pitch Length"},
-                    title=f"{selected_player_name} - Shots in Last {gw_window} Matches",
-                )
+                # Side-by-side Layout: Pitch Map (Left) & Zone Table (Right)
+                col_map, col_stats = st.columns([3, 2])
 
-                fig.update_xaxes(range=[0, 1], showgrid=False, zeroline=False)
-                fig.update_yaxes(
-                    range=[0.5, 1.05], showgrid=False, zeroline=False
-                )
+                with col_map:
+                    st.markdown("##### 📍 Attacking Half Shot Pitch")
 
-                fig.update_layout(
-                    height=500,
-                    plot_bgcolor="#1e1e1e",
-                    paper_bgcolor="#1e1e1e",
-                    font=dict(color="white"),
-                )
+                    fig = px.scatter(
+                        df_recent_shots,
+                        x="Y",
+                        y="X",
+                        color="result",
+                        size="xG",
+                        size_max=18,
+                        hover_data=[
+                            "minute",
+                            "xG",
+                            "shotType",
+                            "situation",
+                            "date",
+                        ],
+                        labels={"Y": "Pitch Width", "X": "Pitch Length"},
+                        title=f"{selected_player_name} - Last {gw_window} Games",
+                    )
 
-                st.plotly_chart(fig, use_container_width=True)
+                    fig.update_xaxes(range=[0, 1], showgrid=False, zeroline=False)
+                    fig.update_yaxes(
+                        range=[0.5, 1.05], showgrid=False, zeroline=False
+                    )
+
+                    fig.add_shape(
+                        type="rect",
+                        x0=0.21,
+                        y0=0.83,
+                        x1=0.79,
+                        y1=1.0,
+                        line=dict(color="gray", dash="dash"),
+                    )
+                    fig.add_shape(
+                        type="rect",
+                        x0=0.37,
+                        y0=0.94,
+                        x1=0.63,
+                        y1=1.0,
+                        line=dict(color="gray", dash="dash"),
+                    )
+
+                    fig.update_layout(
+                        height=480,
+                        plot_bgcolor="#1e1e1e",
+                        paper_bgcolor="#1e1e1e",
+                        font=dict(color="white"),
+                    )
+
+                    st.plotly_chart(fig, use_container_width=True)
+
+                with col_stats:
+                    st.markdown("##### 📊 Shot Performance by Zone")
+
+                    zone_summary = (
+                        df_recent_shots.groupby("Shot_Zone")
+                        .agg(
+                            Shots=("id", "count"),
+                            Goals=(
+                                "result",
+                                lambda s: (s == "Goal").sum(),
+                            ),
+                            xG=("xG", "sum"),
+                        )
+                        .reset_index()
+                    )
+
+                    # Add combined In-Box summary row
+                    in_box_df = zone_summary[
+                        zone_summary["Shot_Zone"].isin(
+                            ["Penalty Area", "Six-Yard Box"]
+                        )
+                    ]
+                    if not in_box_df.empty:
+                        combined_row = pd.DataFrame(
+                            [
+                                {
+                                    "Shot_Zone": "📦 Inside Box (Total)",
+                                    "Shots": in_box_df["Shots"].sum(),
+                                    "Goals": in_box_df["Goals"].sum(),
+                                    "xG": in_box_df["xG"].sum(),
+                                }
+                            ]
+                        )
+                        zone_summary = pd.concat(
+                            [zone_summary, combined_row], ignore_index=True
+                        )
+
+                    zone_summary["xG"] = zone_summary["xG"].round(2)
+                    zone_summary["Conversion %"] = (
+                        (zone_summary["Goals"] / zone_summary["Shots"]) * 100
+                    ).round(1)
+
+                    st.dataframe(zone_summary, use_container_width=True)
+
+                    st.markdown("##### 🦶 Shot Type / Body Part")
+                    shot_type_counts = (
+                        df_recent_shots["shotType"]
+                        .value_counts()
+                        .reset_index()
+                    )
+                    shot_type_counts.columns = ["Shot Type", "Count"]
+                    st.dataframe(shot_type_counts, use_container_width=True)
 
     # ==========================================
-    # TAB 3: RECENT TEAM xGA (DEFENSIVE VULNERABILITY)
+    # TAB 3: RECENT TEAM xGA
     # ==========================================
     with tab3:
         st.subheader(f"🛡️ Defensive xGA (Last {gw_window} Games)")
