@@ -149,7 +149,7 @@ else:
     )
 
     # ==========================================
-    # TAB 1: PLAYER METRICS (Original fast table)
+    # TAB 1: PLAYER METRICS & FILTERS
     # ==========================================
     with tab1:
         df_players = pd.DataFrame(data["playersData"])
@@ -212,6 +212,9 @@ else:
         min_xg = st.sidebar.number_input(
             "Min xG", min_value=0.0, value=0.0, step=0.1
         )
+        min_key_passes = st.sidebar.number_input(
+            "Min Key Passes", min_value=0.0, value=0.0, step=1.0
+        )
 
         filtered_df = df_players.copy()
 
@@ -233,6 +236,10 @@ else:
             filtered_df = filtered_df[filtered_df["shots"] >= min_shots]
         if min_xg > 0:
             filtered_df = filtered_df[filtered_df["xG"] >= min_xg]
+        if min_key_passes > 0:
+            filtered_df = filtered_df[
+                filtered_df["key_passes"] >= min_key_passes
+            ]
 
         display_columns = [
             "player_name",
