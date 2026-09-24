@@ -2,3 +2,4 @@ streamlit
 pandas
 understatapi
 plotly
+aiohttp
