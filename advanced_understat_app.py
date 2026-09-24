@@ -130,6 +130,7 @@ else:
                     df_players[col], errors="coerce"
                 ).fillna(0)
 
+        # Basic Per 90 metrics
         df_players["xG_p90"] = (
             df_players["xG"] / df_players["time"].replace(0, 1)
         ) * 90
@@ -282,7 +283,7 @@ else:
                 "time": "Mins",
                 "goals": "Goals",
                 "xG": "xG",
-                "shots": "Shots",
+                "shots": "Total Shots",
                 "assists": "Assists",
                 "xA": "xA",
                 "key_passes": "Key Passes",
@@ -565,6 +566,31 @@ else:
                         )
                         .reset_index()
                     )
+
+                    # Compute combined In-Box metric for quick summary
+                    in_box_df = zone_summary[
+                        zone_summary["Shot_Zone"].isin(
+                            ["Penalty Area", "Six-Yard Box"]
+                        )
+                    ]
+                    if not in_box_df.empty:
+                        combined_row = pd.DataFrame(
+                            [
+                                {
+                                    "Shot_Zone": "📦 Inside Box (Total)",
+                                    "Shots": in_box_df["Shots"].sum(),
+                                    "Goals": in_box_df["Goals"].sum(),
+                                    "xG": in_box_df["xG"].sum(),
+                                    "Avg_xG_Per_Shot": in_box_df[
+                                        "xG"
+                                    ].sum()
+                                    / max(in_box_df["Shots"].sum(), 1),
+                                }
+                            ]
+                        )
+                        zone_summary = pd.concat(
+                            [zone_summary, combined_row], ignore_index=True
+                        )
 
                     zone_summary["xG"] = zone_summary["xG"].round(2)
                     zone_summary["Avg_xG_Per_Shot"] = zone_summary[
