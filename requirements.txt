@@ -3,3 +3,4 @@ pandas
 requests
 understatapi
 plotly
+selenium==4.9.1
