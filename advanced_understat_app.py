@@ -99,7 +99,7 @@ if not data or "playersData" not in data or not data["playersData"]:
 else:
     # --- CREATE TABS ---
     tab1, tab2, tab3 = st.tabs(
-        ["⚽ Player Metrics", "🎯 Shot Maps & Zones", "🛡️ Team Vulnerability (xGA)"]
+        ["⚽ Player Metrics", "🎯 Shot Maps & Form", "🛡️ Team Vulnerability (xGA)"]
     )
 
     # ==========================================
@@ -349,13 +349,12 @@ else:
             st.warning("No players match your threshold filters.")
 
     # ==========================================
-    # TAB 2: SHOT MAPS & ZONES ANALYSIS
+    # TAB 2: SHOT MAPS & FORM INDICATOR
     # ==========================================
     with tab2:
-        st.subheader("🎯 Player Shot Map & Zone Breakdown")
+        st.subheader("🎯 Player Shot Map & 5-Game Form Indicator")
         st.markdown(
-            "Analyze shot locations, shot quality ($xG$), and spatial"
-            " efficiency for individual players."
+            "Analyze shot locations, shot quality ($xG$), and recent **rolling 5-game form** (Last 3 matches vs. Previous 2 matches)."
         )
 
         player_options = (
@@ -365,7 +364,7 @@ else:
         )
 
         selected_player_name = st.selectbox(
-            "Select Player for Shot Analysis", options=player_options, index=0
+            "Select Player for Shot & Form Analysis", options=player_options, index=0
         )
 
         player_info = df_players[
@@ -373,7 +372,7 @@ else:
         ].iloc[0]
         player_id = player_info["id"]
 
-        with st.spinner(f"Loading shot map data for {selected_player_name}..."):
+        with st.spinner(f"Loading shot map & match logs for {selected_player_name}..."):
             df_shots = load_player_shot_data(player_id)
 
         if df_shots.empty:
@@ -404,6 +403,94 @@ else:
                 df_shots["Shot_Zone"] = df_shots.apply(
                     lambda r: classify_shot_zone(r["X"], r["Y"]), axis=1
                 )
+                df_shots["date"] = pd.to_datetime(df_shots["date"])
+
+                # --- 📈 RECENT FORM CALCULATIONS (LAST 3 VS PREVIOUS 2 GAMES) ---
+                st.markdown("---")
+                st.markdown("### 📈 Recent 5-Game Shot Form Indicator")
+
+                # Get unique matches chronologically
+                match_group = (
+                    df_shots.groupby(["match_id", "date"])
+                    .agg(
+                        Shots=("id", "count"),
+                        xG=("xG", "sum"),
+                        Goals=("result", lambda s: (s == "Goal").sum()),
+                    )
+                    .reset_index()
+                    .sort_values("date")
+                )
+
+                total_matches = len(match_group)
+
+                if total_matches < 5:
+                    st.info(
+                        f"**{selected_player_name}** has recorded shots in"
+                        f" {total_matches} match(es) this season. At least 5 matches"
+                        " with shots are required for full 3-vs-2 rolling form comparison."
+                    )
+                else:
+                    last_5 = match_group.tail(5).copy().reset_index(drop=True)
+
+                    # Split: First 2 games vs Last 3 games
+                    prev_2 = last_5.iloc[0:2]
+                    last_3 = last_5.iloc[2:5]
+
+                    avg_shots_prev_2 = prev_2["Shots"].mean()
+                    avg_shots_last_3 = last_3["Shots"].mean()
+
+                    shots_diff = avg_shots_last_3 - avg_shots_prev_2
+                    pct_change = (
+                        (shots_diff / max(avg_shots_prev_2, 0.1)) * 100
+                    )
+
+                    last_3_xg = last_3["xG"].sum()
+                    last_3_goals = last_3["Goals"].sum()
+
+                    c1, c2, c3, c4 = st.columns(4)
+
+                    with c1:
+                        st.metric(
+                            label="Last 3 Games Avg Shots",
+                            value=f"{avg_shots_last_3:.2f} / game",
+                            delta=(
+                                f"{shots_diff:+.2f} / game ({pct_change:+.0f}%) vs prev 2 games"
+                            ),
+                        )
+
+                    with c2:
+                        st.metric(
+                            label="Prev 2 Games Avg Shots",
+                            value=f"{avg_shots_prev_2:.2f} / game",
+                        )
+
+                    with c3:
+                        st.metric(
+                            label="Last 3 Games xG",
+                            value=f"{last_3_xg:.2f}",
+                        )
+
+                    with c4:
+                        st.metric(
+                            label="Last 3 Games Goals",
+                            value=f"{last_3_goals}",
+                        )
+
+                    # Form trend callout
+                    if shots_diff > 0.2:
+                        st.success(
+                            f"🔥 **HOT FORM:** {selected_player_name} is averaging **{shots_diff:+.2f} more shots/game** over his last 3 matches compared to his previous 2."
+                        )
+                    elif shots_diff < -0.2:
+                        st.warning(
+                            f"📉 **COOLING DOWN:** {selected_player_name} is averaging **{abs(shots_diff):.2f} fewer shots/game** over his last 3 matches compared to his previous 2."
+                        )
+                    else:
+                        st.info(
+                            f"➖ **STABLE FORM:** {selected_player_name}'s shot volume over the last 3 matches matches his previous 2 games."
+                        )
+
+                st.markdown("---")
 
                 # Split layout: Pitch Map & Zone Summary
                 col_map, col_stats = st.columns([3, 2])
@@ -411,7 +498,6 @@ else:
                 with col_map:
                     st.markdown("##### 📍 Attacking Half Shot Pitch")
 
-                    # Draw shot locations with Plotly
                     fig = px.scatter(
                         df_shots,
                         x="Y",
@@ -435,13 +521,11 @@ else:
                         title=f"{selected_player_name} Shot Locations (Attacking Right)",
                     )
 
-                    # Invert Y and adjust ranges to resemble an attacking pitch half
                     fig.update_xaxes(range=[0, 1], showgrid=False, zeroline=False)
                     fig.update_yaxes(
                         range=[0.5, 1.05], showgrid=False, zeroline=False
                     )
 
-                    # Draw key box outlines
                     fig.add_shape(
                         type="rect",
                         x0=0.21,
@@ -471,7 +555,6 @@ else:
                 with col_stats:
                     st.markdown("##### 📊 Shot Performance by Zone")
 
-                    # Aggregate Metrics by Shot Zone
                     zone_summary = (
                         df_shots.groupby("Shot_Zone")
                         .agg(
@@ -493,7 +576,6 @@ else:
 
                     st.dataframe(zone_summary, use_container_width=True)
 
-                    # Shot Body Part Breakdown
                     st.markdown("##### 🦶 Shot Type / Body Part")
                     shot_type_counts = (
                         df_shots["shotType"].value_counts().reset_index()
