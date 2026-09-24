@@ -59,9 +59,14 @@ async def fetch_league_data(season_year):
     async with aiohttp.ClientSession() as session:
         understat = Understat(session)
         player_data = await understat.get_league_players("EPL", season_year)
-        team_data = await understat.get_league_data("EPL", season_year)
-        return {"playersData": player_data, "teamsData": team_data}
-
+        
+        # FIX: Use get_league_results instead of get_league_data
+        team_results = await understat.get_league_results("EPL", season_year)
+        
+        return {
+            "playersData": player_data,
+            "teamsData": team_results
+        }
 
 async def fetch_player_shots(player_id):
     async with aiohttp.ClientSession() as session:
