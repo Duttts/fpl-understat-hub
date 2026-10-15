@@ -62,7 +62,7 @@ def classify_shot_zone(x, y):
 
 
 # --- ASYNC FETCHERS ---
-async def fetch_recent_league_data(season_year, recent_matches_count=5):
+async def fetch_recent_league_data_with_shots(season_year, recent_matches_count=5):
     async with aiohttp.ClientSession() as session:
         understat = Understat(session)
 
@@ -75,7 +75,6 @@ async def fetch_recent_league_data(season_year, recent_matches_count=5):
         df_results["datetime"] = pd.to_datetime(df_results["datetime"])
         df_results = df_results.sort_values("datetime")
 
-        # Extract last N match IDs per team
         recent_match_ids = set()
         team_last_n_matches = {}
 
@@ -92,29 +91,35 @@ async def fetch_recent_league_data(season_year, recent_matches_count=5):
             team_last_n_matches[team] = team_matches
             recent_match_ids.update(team_matches["id"].tolist())
 
-        # 2. Fetch league player data (full season aggregate for fast main table loading)
+        # 2. Fetch league player data
         player_data = await understat.get_league_players("EPL", season_year)
+
+        # 3. Fetch all player shots concurrently for fast local processing
+        player_ids = [p["id"] for p in player_data if p.get("id")]
+        shot_tasks = [understat.get_player_shots(pid) for pid in player_ids]
+        shot_results = await asyncio.gather(*shot_tasks, return_exceptions=True)
+
+        all_player_shots = {}
+        for pid, res in zip(player_ids, shot_results):
+            if isinstance(res, list):
+                all_player_shots[pid] = res
+            else:
+                all_player_shots[pid] = []
 
         return {
             "playersData": player_data,
             "recentMatchIds": recent_match_ids,
             "results": df_results,
             "teamLastN": team_last_n_matches,
+            "allPlayerShots": all_player_shots,
         }
-
-
-async def fetch_player_shots(player_id):
-    async with aiohttp.ClientSession() as session:
-        understat = Understat(session)
-        shots = await understat.get_player_shots(player_id)
-        return shots
 
 
 # --- 3. DATA LOADERS ---
 @st.cache_data(ttl=1800)
 def load_understat_data(season_year=2026, window=5):
     try:
-        data = asyncio.run(fetch_recent_league_data(season_year, window))
+        data = asyncio.run(fetch_recent_league_data_with_shots(season_year, window))
         if not data or "playersData" not in data:
             st.warning("No data available for the selected season.")
             return None
@@ -124,18 +129,8 @@ def load_understat_data(season_year=2026, window=5):
         return None
 
 
-@st.cache_data(ttl=1800)
-def load_player_shot_data(player_id):
-    try:
-        shots = asyncio.run(fetch_player_shots(player_id))
-        return pd.DataFrame(shots) if shots else pd.DataFrame()
-    except Exception as e:
-        st.error(f"Error fetching shot data: {e}")
-        return pd.DataFrame()
-
-
 with st.spinner(
-    f"Loading data for the last {gw_window} matches per team..."
+    f"Loading league data and recent shots for the last {gw_window} matches..."
 ):
     data = load_understat_data(selected_season, gw_window)
 
@@ -143,6 +138,7 @@ if not data:
     st.info("No data available for the selected parameters.")
 else:
     recent_match_ids = data["recentMatchIds"]
+    all_player_shots = data.get("allPlayerShots", {})
 
     tab1, tab2, tab3 = st.tabs(
         ["⚽ Player Metrics", "🎯 Recent Shot Maps & Zones", "🛡️ Recent Team xGA"]
@@ -297,22 +293,66 @@ else:
             f"🎯 Player Shot Map & Zone Breakdown (Last {gw_window} Team Matches Only)"
         )
 
-        player_options = (
-            df_players.sort_values("shots", ascending=False)["player_name"]
-            .unique()
-            .tolist()
+        df_players = pd.DataFrame(data["playersData"])
+
+        # Calculate in-box shots (Penalty Area + Six-Yard Box) in recent matches for each player
+        player_inbox_counts = []
+        for _, row in df_players.iterrows():
+            pid = row["id"]
+            pname = row["player_name"]
+            p_shots = all_player_shots.get(pid, [])
+            
+            inbox_count = 0
+            if p_shots:
+                df_p = pd.DataFrame(p_shots)
+                if not df_p.empty and "season" in df_p.columns and "match_id" in df_p.columns:
+                    df_p["season"] = pd.to_numeric(df_p["season"], errors="coerce")
+                    df_p = df_p[
+                        (df_p["season"] == selected_season) 
+                        & (df_p["match_id"].isin(recent_match_ids))
+                    ]
+                    if not df_p.empty:
+                        df_p["X"] = pd.to_numeric(df_p["X"], errors="coerce")
+                        df_p["Y"] = pd.to_numeric(df_p["Y"], errors="coerce")
+                        for _, s_row in df_p.iterrows():
+                            zone = classify_shot_zone(s_row["X"], s_row["Y"])
+                            if zone in ["Penalty Area", "Six-Yard Box"]:
+                                inbox_count += 1
+            player_inbox_counts.append({
+                "player_name": pname, 
+                "id": pid, 
+                "inbox_shots": inbox_count
+            })
+
+        df_inbox = pd.DataFrame(player_inbox_counts)
+        # Sort highest to lowest based on in-box shots
+        df_inbox = df_inbox.sort_values(
+            by=["inbox_shots", "player_name"], 
+            ascending=[False, True]
+        ).reset_index(drop=True)
+
+        # Format option labels to show count directly in the dropdown
+        player_options_formatted = [
+            f"{row['player_name']} ({row['inbox_shots']} in-box shots)"
+            for _, row in df_inbox.iterrows()
+        ]
+
+        selected_display_option = st.selectbox(
+            "Select Player for Map & Zones (Ordered by In-Box Shots)",
+            options=player_options_formatted,
+            index=0,
         )
-        selected_player_name = st.selectbox(
-            "Select Player for Map & Zones", options=player_options, index=0
-        )
+
+        # Extract selected player name back from the string
+        selected_player_name = selected_display_option.split(" (")[0]
 
         player_info = df_players[
             df_players["player_name"] == selected_player_name
         ].iloc[0]
         player_id = player_info["id"]
 
-        with st.spinner(f"Loading recent shots for {selected_player_name}..."):
-            df_shots = load_player_shot_data(player_id)
+        shots_list = all_player_shots.get(player_id, [])
+        df_shots = pd.DataFrame(shots_list) if shots_list else pd.DataFrame()
 
         if df_shots.empty:
             st.warning(f"No shot data found for {selected_player_name}.")
