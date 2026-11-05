@@ -21,11 +21,10 @@ st.markdown(
 # --- 2. SEASON SELECTOR & SLIDER ---
 selected_season = st.sidebar.selectbox(
     "Select Season",
-    options=[2026, 2025, 2024, 2023],
+    options=[2025, 2024, 2023],  # Removed 2026
     format_func=lambda x: f"{x}/{x+1-2000}",
-    index=0,
+    index=0,  # Defaults to 2025 (the 2025/26 season)
 )
-
 gw_window = st.sidebar.slider(
     "Recent Match Window",
     min_value=3,
