@@ -116,11 +116,12 @@ async def fetch_recent_league_data_with_shots(season_year, recent_matches_count=
 
 # --- 3. DATA LOADERS ---
 @st.cache_data(ttl=1800)
-def load_understat_data(season_year=2026, window=5):
+def load_understat_data(season_year=2025, window=5):
     try:
+        # Pass the selected season into the async loop
         data = asyncio.run(fetch_recent_league_data_with_shots(season_year, window))
-        if not data or "playersData" not in data:
-            st.warning("No data available for the selected season.")
+        if not data or not data.get("playersData"):
+            st.warning(f"No data returned for season {season_year}. Understat may be blocking requests or the season isn't available.")
             return None
         return data
     except Exception as e:
